@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lowlight-restoration"
+version = "1.0.0"
+description = "Low-light static photo restoration with calibrated/estimated Poisson-Gaussian denoising and constrained shadow lifting"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python-headless>=4.7",
+    "matplotlib>=3.7",
+    "Pillow>=9.5",
+]
+
+[project.scripts]
+lowlight-gui = "lowlight.gui:main"
+lowlight = "lowlight.cli:main"
+
+[tool.setuptools]
+packages = ["lowlight"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,100 @@
+{
+  "config": {
+    "strength": 1.0,
+    "method": "nlm",
+    "alpha": 0.004,
+    "sigma_r": 0.006,
+    "input_is_linear": false,
+    "sat_threshold": 0.995,
+    "lift": {
+      "shadow_level": 0.12,
+      "shadow_quantile": 0.1,
+      "max_gain": 8.0,
+      "rolloff_quantile": 0.6,
+      "black_fraction": 0.001
+    }
+  },
+  "stats": {
+    "noise_params": {
+      "alpha": 0.004,
+      "sigma_r": 0.006,
+      "source": "calibration"
+    },
+    "estimation": null,
+    "denoise": {
+      "method": "nlm",
+      "strength": 1.0,
+      "template_size": 7,
+      "search_size": 21,
+      "per_channel": [
+        {
+          "channel": "R",
+          "gat_var_before": 5.910163087344577,
+          "gat_var_after": 4.291526909345388
+        },
+        {
+          "channel": "G",
+          "gat_var_before": 5.712510298843687,
+          "gat_var_after": 4.022231564959511
+        },
+        {
+          "channel": "B",
+          "gat_var_before": 5.930468985746599,
+          "gat_var_after": 4.346223125098645
+        }
+      ],
+      "gat_clip_fraction": 0.07031901041666666
+    },
+    "lift": {
+      "params": {
+        "shadow_level": 0.12,
+        "shadow_quantile": 0.1,
+        "max_gain": 8.0,
+        "rolloff_quantile": 0.6,
+        "black_fraction": 0.001
+      },
+      "luma_quantiles": {
+        "shadow_q": 0.008173897748321524,
+        "rolloff_q": 0.037972577856001166,
+        "black_floor": 0.000540145724379672
+      },
+      "applied_shadow_gain": 8.0,
+      "requested_gain_uncapped": 15.719661789332713,
+      "gain_capped": true,
+      "clip_fraction_after_lift": 0.000107421875,
+      "luma_mean_before": 0.03162396885389739,
+      "luma_mean_after": 0.05421749066280783,
+      "max_output_before_clip": 1.2042972490696873
+    },
+    "reliability": {
+      "saturated": 0.0,
+      "black_floor": 0.010439453125,
+      "model_bound": 0.0,
+      "out_of_range": 0.0,
+      "reliable_fraction": 0.989560546875,
+      "residual_rms_linear": 0.015721393093463973,
+      "residual_mean_linear": -0.008093963003153522
+    },
+    "warnings": [],
+    "color": {
+      "mean_rgb_observed_linear": [
+        0.04278947383176515,
+        0.03787390390314531,
+        0.046722998023592345
+      ],
+      "mean_rgb_restored_linear": [
+        0.06350451791902635,
+        0.04931567136230588,
+        0.07542745145301355
+      ]
+    },
+    "luma_mean_observed": 0.03955785866548414,
+    "luma_mean_restored": 0.05421749066280783
+  },
+  "outputs": {
+    "original": "/workspace/examples/cli_run/original.png",
+    "restored": "/workspace/examples/cli_run/restored.png",
+    "residual": "/workspace/examples/cli_run/residual.png",
+    "reliability": "/workspace/examples/cli_run/reliability.png"
+  }
+}
