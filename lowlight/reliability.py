@@ -15,6 +15,8 @@ import numpy as np
 
 from .noise import NoiseParams
 
+_LUMA = np.array([0.2126, 0.7152, 0.0722])
+
 SATURATED = 1
 BLACK_FLOOR = 2
 MODEL_BOUND = 4
@@ -68,3 +70,47 @@ def flags_to_rgb(flags: np.ndarray) -> np.ndarray:
     rgb[(flags & SATURATED) > 0] = (255, 0, 0)
     rgb[(flags & OUT_OF_RANGE) > 0] = (255, 0, 255)
     return rgb
+
+
+def restored_anomalies(restored: np.ndarray, observed: np.ndarray,
+                       dark_luma: float = 0.25) -> dict:
+    """Describe artifacts *in the restored image*, which the input flags miss.
+
+    The existing flags inspect the observation (is a pixel saturated? below the
+    read floor?), so a badly mis-declared calibration can produce a visibly
+    corrupted restoration while ``reliable_fraction`` stays high.  This looks at
+    the output instead and returns both the numbers and a list of plain-language
+    warnings, without altering a single pixel.
+
+    Metrics:
+    * ``speckle_fraction`` - dark pixels with a large R-G-B spread (colour
+      speckling, the classic sign of an over-aggressive gain on noise);
+    * ``clip_fraction`` - output pixels pinned at 0 or 1 after lifting;
+    * ``dark_residual_rms`` - RMS(restored - observed) over dark pixels, i.e.
+      how far the lift moved the noisy shadow away from the measurement.
+    """
+    out = np.asarray(restored, dtype=np.float64)
+    obs = np.asarray(observed, dtype=np.float64)
+    luma = np.einsum("...c,c->...", out, _LUMA)
+    dark = luma < dark_luma
+    spread = out.max(axis=-1) - out.min(axis=-1)
+    speckle = float(np.mean((spread > 0.15) & dark)) if dark.any() else 0.0
+    clip = float(np.mean((out >= 0.999) | (out <= 0.0)))
+    if dark.any():
+        dark_res = float(np.sqrt(np.mean((out[dark] - obs[dark]) ** 2)))
+    else:
+        dark_res = 0.0
+
+    warnings = []
+    if speckle > 0.02:
+        warnings.append(
+            f"恢复图像暗部彩色斑点 {speckle:.1%}：噪声被放大，"
+            "可能是标定 α/σ_r 偏高或强度过大")
+    if clip > 0.05:
+        warnings.append(f"恢复图像 {clip:.1%} 像素触顶/触底：提升增益可能过高")
+    if dark_res > 0.10:
+        warnings.append(
+            f"暗部残差 RMS {dark_res:.3f} 偏大：恢复结果与观测偏离，"
+            "请核对噪声标定或降低强度")
+    return {"speckle_fraction": speckle, "clip_fraction": clip,
+            "dark_residual_rms": dark_res, "warnings": warnings}

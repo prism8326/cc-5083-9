@@ -81,21 +81,32 @@ def inverse_gat(z: np.ndarray, params: NoiseParams) -> np.ndarray:
     value in *count units* x/alpha, so the result is scaled by alpha.  The
     forward transform already subtracts the read-noise offset sigma_r^2/alpha,
     hence no offset is added back here.
+
+    The two branches are evaluated on their own index subsets and written into
+    one preallocated output.  This is bit-identical to evaluating both
+    full-frame branches and selecting with ``where``, but a large frame no
+    longer allocates several image-sized float temporaries (previously about
+    5x the frame), which is what dominated the pipeline's peak memory.
     """
     zn = np.asarray(z, dtype=np.float64)
     a = max(float(params.alpha), _EPS)
+    out = np.empty_like(zn)
 
-    asymptotic = np.zeros_like(zn)
     hi = zn >= 2.0
     zh = zn[hi]
-    asymptotic[hi] = (0.25 * zh * zh
-                      + 0.25 * np.sqrt(1.5) / zh
-                      - 1.125 / zh ** 2
-                      + 0.125 * np.sqrt(1.5) / zh ** 3
-                      - 0.125 / zh ** 4)
+    if zh.size:
+        out[hi] = a * (0.25 * zh * zh
+                       + 0.25 * np.sqrt(1.5) / zh
+                       - 1.125 / zh ** 2
+                       + 0.125 * np.sqrt(1.5) / zh ** 3
+                       - 0.125 / zh ** 4)
+
+    lo = ~hi
     # The rational approximation is numerically safest on [0, 2); clip only
     # the tiny sub-zero tail that can arise from finite-precision inputs.
-    zc = np.clip(zn, 0.0, 2.0)
-    rational = (zc * (zc * (zc * (zc * (zc * _P6 + _P5) + _P4) + _P3) + _P2) + _P1) \
-        / (zc * (zc * (zc * _P4 + _P3) + _P2) + 1.0)
-    return a * np.where(hi, asymptotic, rational)
+    zc = np.clip(zn[lo], 0.0, 2.0)
+    if zc.size:
+        out[lo] = a * ((zc * (zc * (zc * (zc * (zc * _P6 + _P5) + _P4) + _P3)
+                          + _P2) + _P1)
+                       / (zc * (zc * (zc * _P4 + _P3) + _P2) + 1.0))
+    return out

@@ -210,3 +210,153 @@ def test_zero_image_pipeline_does_not_invent_signal():
 def test_srgb_roundtrip():
     x = np.linspace(0, 1, 50)
     np.testing.assert_allclose(linear_to_srgb(srgb_to_linear(x)), x, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Optimization invariants: tiling, caching, exact Theil-Sen, determinism.
+# ---------------------------------------------------------------------------
+from lowlight.cache import CacheConfig
+from lowlight.calibration import estimate_noise_legacy
+from lowlight.denoise import nlm_halo, _nlm_channel, _nlm_channel_tiled
+from lowlight.pipeline import reset_session_cache, run_pipeline_legacy
+from lowlight.stats import (compute_patch_statistics, content_digest,
+                            median_pairwise_slope, theilslopes_fast,
+                            uniform_subsample)
+from lowlight.workloads import make_workload
+
+
+def _tiled_vs_untiled(img, side, **kw):
+    a = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                         tile_pixels=0, **kw))
+    b = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                         tile_pixels=1, tile_side=side, **kw))
+    return a, b
+
+
+@pytest.mark.parametrize("side", [96, 128, 181, 256])
+def test_tiled_nlm_is_bit_exact(fixture256, side):
+    """Cores are disjoint and halo >= search//2 + template//2, so tiles must
+    reproduce the untiled result exactly (no seam, no double write)."""
+    a, b = _tiled_vs_untiled(fixture256["observed_srgb"], side)
+    assert np.array_equal(a.rgb_linear_denoised, b.rgb_linear_denoised)
+
+
+def test_tiled_nlm_odd_shape_is_bit_exact():
+    rng = np.random.default_rng(4)
+    img = np.clip(rng.normal(0.08, 0.03, (333, 517, 3)), 0, 1)
+    a, b = _tiled_vs_untiled(img, 128)
+    assert np.array_equal(a.rgb_linear_denoised, b.rgb_linear_denoised)
+
+
+def test_halo_formula_covers_min_window():
+    # For the smallest supported windows the halo must be a positive ring
+    # (zero halo would drop the search neighbours that shape each output).
+    assert nlm_halo(3, 5) == max(1, 5 // 2 + 3 // 2)
+    assert nlm_halo(7, 21) == 13
+
+
+def test_fast_theilsen_matches_scipy_on_random_data():
+    from scipy import stats
+    rng = np.random.default_rng(5)
+    for n in (50, 200, 1000, 2500):
+        x = rng.uniform(0.0, 0.3, n)
+        y = 0.004 * x + 0.000036 + rng.normal(0.0, 5e-6, n)
+        slope, intercept = theilslopes_fast(y, x)
+        ref = stats.theilslopes(y, x)
+        assert abs(slope - ref.slope) <= 1e-8 * max(abs(ref.slope), 1e-12)
+        assert abs(intercept - ref.intercept) <= 1e-10
+
+
+def test_fast_theilsen_handles_duplicate_x():
+    from scipy import stats
+    rng = np.random.default_rng(6)
+    x = np.round(rng.uniform(0.0, 0.3, 400), 2)  # many equal x
+    y = 0.005 * x + 0.00002 + rng.normal(0.0, 3e-6, 400)
+    slope, intercept = theilslopes_fast(y, x)
+    ref = stats.theilslopes(y, x)
+    assert abs(slope - ref.slope) <= 1e-8 * max(abs(ref.slope), 1e-12)
+
+
+def test_estimator_matches_legacy_where_legacy_is_feasible(fixture256):
+    """At 256px the legacy O(n^2) fit is still runnable; parameters must agree."""
+    new_p, new_i = None, None
+    from lowlight.calibration import estimate_noise
+    new_p, new_i = estimate_noise(fixture256["observed_linear"])
+    old_p, old_i = estimate_noise_legacy(fixture256["observed_linear"])
+    assert abs(new_p.alpha - old_p.alpha) < 5e-6
+    assert abs(new_p.sigma_r - old_p.sigma_r) < 5e-6
+    assert new_i.n_used == old_i.n_used
+
+
+def test_patch_statistics_chunking_is_bit_identical():
+    import lowlight.stats as S
+    w = make_workload("dense_texture", 200, seed=2)
+    base = compute_patch_statistics(w["observed_linear"])
+    orig = S.BLOCK_CHUNK_ROWS
+    try:
+        for rows in (1, 9, 500):
+            S.BLOCK_CHUNK_ROWS = rows
+            p = compute_patch_statistics(w["observed_linear"])
+            assert np.array_equal(p.means, base.means)
+            assert np.array_equal(p.variances, base.variances)
+    finally:
+        S.BLOCK_CHUNK_ROWS = orig
+
+
+def test_uniform_subsample_is_deterministic_and_bounded():
+    v = np.arange(10000)
+    s1 = uniform_subsample(v, 100)
+    s2 = uniform_subsample(v.copy(), 100)
+    assert s1.size == 100 and np.array_equal(s1, s2)
+    assert s1[0] == 0 and s1[-1] == 9900
+
+
+def test_cache_reuses_and_invalidates_on_parameter_change(fixture256):
+    reset_session_cache()
+    img = fixture256["observed_srgb"]
+    cfgc = CacheConfig()
+    r1 = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                          cache=cfgc))
+    assert r1.stats["timing_s"]["denoise_cache_hit"] is False
+    r2 = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                          cache=cfgc))
+    assert r2.stats["timing_s"]["denoise_cache_hit"] is True
+    assert np.array_equal(r2.rgb_linear_denoised, r1.rgb_linear_denoised)
+
+    # A different strength must invalidate the denoise entry but keep the GAT.
+    r3 = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                          strength=1.5, cache=cfgc))
+    assert r3.stats["timing_s"]["denoise_cache_hit"] is False
+    assert r3.stats["timing_s"]["gat_cache_hit"] is True
+    assert not np.array_equal(r3.rgb_linear_denoised, r1.rgb_linear_denoised)
+
+    # A different template size must also invalidate the denoise entry.
+    r4 = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                          strength=1.5, template_size=5,
+                                          cache=cfgc))
+    assert r4.stats["timing_s"]["denoise_cache_hit"] is False
+
+    # A different alpha invalidates GAT and hence the denoise entry.
+    r5 = run_pipeline(img, PipelineConfig(alpha=0.005, sigma_r=SIGMA,
+                                          cache=cfgc))
+    assert r5.stats["timing_s"]["gat_cache_hit"] is False
+
+
+def test_cached_and_uncached_results_are_identical(fixture256):
+    reset_session_cache()
+    img = fixture256["observed_srgb"]
+    a = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                         use_cache=False))
+    b = run_pipeline(img, PipelineConfig(alpha=ALPHA, sigma_r=SIGMA,
+                                         cache=CacheConfig()))
+    assert np.array_equal(a.rgb_linear_denoised, b.rgb_linear_denoised)
+    assert np.array_equal(a.rgb_linear_restored, b.rgb_linear_restored)
+    assert np.array_equal(a.flags, b.flags)
+
+
+def test_new_pipeline_matches_legacy_pixels_with_declared_calibration(fixture256):
+    cfg = PipelineConfig(alpha=ALPHA, sigma_r=SIGMA, strength=1.0)
+    new = run_pipeline(fixture256["observed_srgb"], cfg)
+    old = run_pipeline_legacy(fixture256["observed_srgb"], cfg)
+    assert np.array_equal(new.rgb_linear_denoised, old.rgb_linear_denoised)
+    assert np.array_equal(new.rgb_linear_restored, old.rgb_linear_restored)

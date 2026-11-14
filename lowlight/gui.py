@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -66,7 +67,8 @@ if _CJK_FONT:
 
 from .color import linear_luma
 from .lifting import LiftParams
-from .pipeline import PipelineConfig, export_results, read_image, run_pipeline
+from .pipeline import (PipelineConfig, export_results, read_image,
+                       reset_session_cache, run_pipeline)
 
 
 class LowlightWindow:
@@ -80,6 +82,9 @@ class LowlightWindow:
         self.image_path = None
         self.result = None
         self._busy = False
+        self._run_started_at = None
+        self._last_elapsed = None
+        self._run_generation = 0
         # When True the pipeline runs on the calling thread; used by the
         # headless tests so result delivery is deterministic.
         self.synchronous = False
@@ -161,6 +166,16 @@ class LowlightWindow:
         ttk.Button(bar, text="导出原图/恢复图/残差/可靠性图与参数 JSON…",
                    command=self.on_export).pack(fill=tk.X, pady=2)
 
+        run_box = ttk.LabelFrame(bar, text="运行状态", padding=6)
+        run_box.pack(fill=tk.X, pady=4)
+        self.run_state_var = tk.StringVar(value="空闲")
+        self.run_state_lbl = ttk.Label(run_box, textvariable=self.run_state_var,
+                                       foreground="#333")
+        self.run_state_lbl.pack(anchor="w")
+        self.run_elapsed_var = tk.StringVar(value="尚未运行")
+        ttk.Label(run_box, textvariable=self.run_elapsed_var,
+                  foreground="#666").pack(anchor="w")
+
         ttk.Separator(bar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         self.status = tk.Text(bar, width=38, height=14, wrap=tk.WORD,
                               background="#f7f7f7", relief=tk.GROOVE)
@@ -205,6 +220,23 @@ class LowlightWindow:
         self.status.insert(tk.END, text + "\n", level)
         self.status.configure(state=tk.DISABLED)
 
+    def _write_status_lines(self, lines: list[tuple[str, str]]) -> None:
+        """Write ``(text, tag)`` lines so anomaly rows can be red individually."""
+        self.status.configure(state=tk.NORMAL)
+        self.status.delete("1.0", tk.END)
+        for text, tag in lines:
+            self.status.insert(tk.END, text + "\n", tag)
+        self.status.configure(state=tk.DISABLED)
+
+    def _set_run_state(self, state: str, detail: str = "") -> None:
+        """Drive the visible run-state indicator (idle / running / done / error)."""
+        icons = {"idle": "● 空闲", "running": "◐ 运算中…", "done": "√ 完成",
+                 "error": "✗ 异常"}
+        self.run_state_var.set(icons.get(state, state) + (f"  {detail}" if detail else ""))
+        colors = {"idle": "#333", "running": "#0050a0", "done": "#1b6b1b",
+                  "error": "#b00020"}
+        self.run_state_lbl.configure(foreground=colors.get(state, "#333"))
+
     # ------------------------------------------------------------- actions
     def on_open(self) -> None:
         path = filedialog.askopenfilename(
@@ -221,6 +253,9 @@ class LowlightWindow:
         self.image_path = path
         self.path_var.set(os.path.basename(path))
         self.result = None
+        # A different image invalidates every cached stage; drop the session
+        # cache so stale arrays from the previous photo can never be reused.
+        reset_session_cache()
         self._draw_original()
         self._set_status(
             f"已加载 {meta['shape'][1]}×{meta['shape'][0]} 图像。\n"
@@ -249,6 +284,10 @@ class LowlightWindow:
             self._set_status(err, level="error")
             return
         self._busy = True
+        self._run_generation += 1
+        self._run_started_at = time.perf_counter()
+        self._set_run_state("running", f"第 {self._run_generation} 次")
+        self.run_elapsed_var.set("已运行 0.0 s")
         self._set_status("正在运算（GAT 稳定化 → 边缘保持去噪 → 逆变换 → 约束提升）…",
                          level="info")
         cfg = PipelineConfig(
@@ -279,28 +318,63 @@ class LowlightWindow:
 
     def _on_run_failed(self, exc: Exception) -> None:
         self._busy = False
+        elapsed = (time.perf_counter() - self._run_started_at
+                   if self._run_started_at else 0.0)
+        self._set_run_state("error", f"{type(exc).__name__}")
+        self.run_elapsed_var.set(f"失败于 {elapsed:.2f} s")
         self._set_status(f"恢复过程出现异常：\n{type(exc).__name__}: {exc}",
                          level="error")
 
     def _on_run_done(self, result) -> None:
         self._busy = False
         self.result = result
+        elapsed = (time.perf_counter() - self._run_started_at
+                   if self._run_started_at else 0.0)
+        self._last_elapsed = elapsed
         self._draw_results()
         s = result.stats
         p = result.params
-        lines = [f"噪声来源：{ {'calibration':'用户声明','estimate':'自动估计','default':'默认回退'}[p.source] }",
-                 f"α={p.alpha:.6g}  σ_r={p.sigma_r:.6g}（线性单位）",
-                 f"可靠像素比例：{s['reliability']['reliable_fraction']:.2%}",
-                 f"饱和：{s['reliability']['saturated']:.2%}  "
-                 f"黑底不可恢复：{s['reliability']['black_floor']:.2%}",
-                 f"阴影增益：{s['lift']['applied_shadow_gain']:.2f}× "
-                 f"（触顶={s['lift']['gain_capped']}）",
-                 f"暗部均值 {s['luma_mean_observed']:.4f} → {s['luma_mean_restored']:.4f}",
-                 f"残差 RMS（线性）：{s['reliability']['residual_rms_linear']:.5f}"]
-        if s["warnings"]:
-            lines.append("提示：" + "；".join(s["warnings"]))
-        self._set_status("\n".join(lines),
-                         level="warn" if s["warnings"] else "info")
+        timing = s.get("timing_s", {})
+        self._set_run_state("done", f"{elapsed:.2f} s")
+        self.run_elapsed_var.set(
+            f"运行 {elapsed:.2f} s  |  预处理 {timing.get('patch_stats_s', 0.0):.2f} s"
+            f"  |  GAT {timing.get('gat_s', 0.0):.2f} s"
+            f"  |  去噪 {timing.get('denoise_s', 0.0):.2f} s")
+        evalue = s.get("estimation") or {}
+        rows = [(f"噪声来源：{ {'calibration':'用户声明','estimate':'自动估计','default':'默认回退'}[p.source] }", "info"),
+                (f"α={p.alpha:.6g}  σ_r={p.sigma_r:.6g}（线性单位）", "info"),
+                (f"可靠像素比例：{s['reliability']['reliable_fraction']:.2%}", "info"),
+                (f"饱和：{s['reliability']['saturated']:.2%}  "
+                 f"黑底不可恢复：{s['reliability']['black_floor']:.2%}", "info"),
+                (f"阴影增益：{s['lift']['applied_shadow_gain']:.2f}× "
+                 f"（触顶={s['lift']['gain_capped']}）", "info"),
+                (f"暗部均值 {s['luma_mean_observed']:.4f} → {s['luma_mean_restored']:.4f}", "info"),
+                (f"残差 RMS（线性）：{s['reliability']['residual_rms_linear']:.5f}", "info")]
+        if evalue:
+            cache_word = "命中缓存" if evalue.get("cache_hit") else "重新计算"
+            approx = "（抽样近似）" if evalue.get("approximate") else ""
+            rows.append((f"块统计：{evalue.get('n_blocks', 0)} 块，"
+                         f"回归样本 {evalue.get('n_regression', 0)}{approx}，{cache_word}", "info"))
+        if s.get("tiling", {}).get("enabled"):
+            rows.append((f"分块去噪：halo={s['tiling']['nlm_halo']}px"
+                         "（= 搜索窗//2 + 模板窗//2）", "info"))
+        anom = s.get("restored_anomalies") or {}
+        if anom:
+            rows.append(
+                (f"恢复异常：彩色斑点 {anom.get('speckle_fraction', 0.0):.2%}，"
+                 f"触顶/底 {anom.get('clip_fraction', 0.0):.2%}，"
+                 f"暗部残差 RMS {anom.get('dark_residual_rms', 0.0):.3f}",
+                 "error" if anom.get("warnings") else "info"))
+        for w in s["warnings"]:
+            rows.append((f"提示：{w}", "warn"))
+        self._write_status_lines(rows)
+        # An output anomaly means the restored image is not trustworthy even if
+        # the input flags look clean; mark the run state and open the dark
+        # comparison so the damaged detail is in front of the user.
+        has_anomaly = bool(anom.get("warnings"))
+        if has_anomaly:
+            self._set_run_state("error", "恢复图像异常")
+            self._draw_shadow_strip()
 
     def on_export(self) -> None:
         if self.result is None:
@@ -365,12 +439,20 @@ class LowlightWindow:
         x0, x1 = max(cx - half, 0), min(cx + half, luma.shape[1])
         win = tk.Toplevel(self.root)
         win.title("暗部细节（实际运算结果） / Shadow detail")
-        # Place beside the main window so the result grid stays visible.
         win.transient(self.root)
-        x = min(self.root.winfo_x() + self.root.winfo_width() + 20,
-                max(self.root.winfo_screenwidth() - 860, 0))
+        # Beside the main window when there is room, otherwise centred on the
+        # screen, so the comparison never hangs off the right edge.
+        win_w, win_h = 834, 420
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        right = self.root.winfo_x() + self.root.winfo_width() + 20
+        if right + win_w <= screen_w:
+            x = right
+        else:
+            x = max((screen_w - win_w) // 2, 0)
         y = max(self.root.winfo_y() + 40, 0)
-        win.geometry(f"+{x}+{y}")
+        y = min(y, max(screen_h - win_h - 10, 0))
+        win.geometry(f"{win_w}x{win_h}+{x}+{y}")
         fig = Figure(figsize=(8, 4), dpi=100)
         ax1, ax2 = fig.subplots(1, 2)
         ax1.imshow(r.display_original()[y0:y1, x0:x1])

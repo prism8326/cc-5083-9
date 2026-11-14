@@ -31,6 +31,12 @@ lowlight-gui
   `restoration_record.json`（实际参数与中间统计，用于复算）。
 - **结果区**：2×2 呈现原图、恢复图像、残差、可靠性图；运行后另弹出“暗部细节”
   对比窗，内容全部来自实际运算数组。
+- **运行状态**：左侧“运行状态”栏实时显示 `空闲 / ◐ 运算中 / √ 完成 / ✗ 异常`，
+  完成时显示总耗时与 GAT、去噪等分阶段耗时。
+- **恢复异常标注**：除逐像素可靠性图外，还会对**恢复图像本身**给出异常数值
+  （暗部彩色斑点比例、触顶/触底比例、暗部残差 RMS）。若判定异常，运行状态转为
+  `✗ 恢复图像异常`、状态区该行标红，并自动打开“暗部细节”对比窗，把受损的暗部细节
+  直接摆在眼前（详见第 4 节）。
 - **异常处理**：读取失败、非法标定、运算异常都显示在窗口下方状态区，不崩溃。
 
 命令行仅用于脚本化批处理（见第 5 节），图形窗口才是主入口。
@@ -104,6 +110,24 @@ lowlight-gui
 
 残差视图以中灰表示 0、正负残差向两侧着色并放大显示；线性域残差 RMS/均值写入 JSON。
 
+### 4.1 恢复图像侧的异常（输入侧标志看不到的问题）
+
+上面这些标志都只看**观测输入**（是否饱和、是否低于读出噪声底）。因此当噪声标定
+声明得明显偏离实际时，恢复图像可能已经明显损坏，而 `reliable_fraction` 仍然很高。
+`lowlight/reliability.py::restored_anomalies` 改为检查**恢复图像输出**，并给出：
+
+| 指标 | 含义 | 默认告警阈值 |
+| --- | --- | --- |
+| `speckle_fraction` | 暗部像素中三通道跨度 > 0.15 的比例（彩色斑点，噪声被放大的典型表现） | > 2% |
+| `clip_fraction` | 输出被钉在 0 或 1 的比例（提升增益过高） | > 5% |
+| `dark_residual_rms` | 暗部恢复值与观测值的 RMS 偏离 | > 0.10 |
+
+以窗口内置的暗光样张为例（720px）：正确标定 `α=0.008, σ_r=0.005` 时彩色斑点为 0.50%、
+暗部残差 RMS 0.028、无告警；错误声明 `α=0.02, σ_r=0.008` 时彩色斑点升到 10.87%、
+触顶/底 15.47%、暗部残差 RMS 0.189，触发 3 条告警——尽管此时输入侧可靠性仍报 96.3% “可靠”。
+这些指标只用于**标注与告警**，不修改任何像素。该逻辑有对应测试
+`tests/test_optimization.py::test_restored_anomalies_flag_bad_calibration_not_good`。
+
 ---
 
 ## 5. 命令行（辅助）
@@ -137,6 +161,9 @@ python -m pytest tests/ -q
 
 # 多曝光/多噪声扫描、纯黑与单色边界、尺寸不变性，并导出示例四视图
 python scripts/evaluate.py --out-dir runs/eval
+
+# 大尺寸优化的代价/一致性测量（三类场景、冷/热、内存峰值、细线残差）
+python scripts/measure_opt.py --out-dir runs/measure --size 768 --large-size 1536
 ```
 
 覆盖的检查项：
@@ -151,23 +178,170 @@ python scripts/evaluate.py --out-dir runs/eval
 
 ---
 
-## 7. 模块结构
+## 7. 大尺寸照片：可复用统计、受控分块与缓存
+
+大尺寸照片上，恢复流程原本会**反复**计算局部噪声统计（每块均值/方差）与
+非局部均值（NLM）的相似邻域搜索。优化保持像素结果不变，只改变代价，拆为三部分。
+
+### 7.1 可复用的统计表示（`lowlight/stats.py`）
+
+`PatchStatistics` 一次性地在固定物理块网格（8×8、步长 4）上计算每通道
+块均值、方差、梯度与饱和掩膜，作为一个可复用对象缓存。它只依赖**图像内容、
+块几何与饱和阈值**，与去噪强度、滤波方式、提升参数无关，因此这些参数变化时
+无需重算。分块计算按块行分块（`BLOCK_CHUNK_ROWS`），对每个块局部求和，
+**分块大小不改变浮点结果**（`test_patch_statistics_chunking_is_bit_identical`）。
+
+Theil–Sen 稳健回归原本在 `scipy` 中物化全部两两斜率，代价 O(n²)——512px 就足以让
+内存耗尽。`stats.py` 用归并排序逆序计数 + 候选斜率二分，求**完全相同**的两两斜率中位数，
+复杂度 O(n log n)。在 320–384px 与 `scipy.stats.theilslopes` 结果一致（斜率达到 ~1e-10）。
+
+### 7.2 受控分块（`lowlight/denoise.py`）
+
+超过 `tile_pixels` 像素时按重叠加窗分块，每块的**上下文环（halo）**由两个窗口尺寸决定：
+
+```
+halo = search_size // 2 + template_size // 2     # 7/21 窗口 → 13 px
+```
+
+每块的**核心区**互不重叠、各写一次；halo 只作为输入、从不写回。因此分块输出与
+整图调用**逐位相同**——无接缝、边界像素不重复处理（`test_tiled_nlm_is_bit_exact`、
+`test_tiled_nlm_odd_shape_is_bit_exact`）。NLM 本身在 OpenCV 内部按线程并行归约，
+但输出与线程数无关（`test_nlm_output_is_thread_count_independent`）。
+
+### 7.3 参数变化精确失效缓存（`lowlight/cache.py`）
+
+按阶段（patch / estimate / GAT / denoise）分设按字节 LRU 缓存，键由**影响该阶段
+结果的完整输入集**构造：
+
+- patch 键：图像内容摘要 + 块几何 + 饱和阈值；
+- estimate 键：patch 键 + 最小样本数 + Theil 预算；
+- GAT 键：图像摘要 + `α`、`σ_r` + 是否线性输入；
+- denoise 键：GAT 键 + 方法 + 强度 + 模板/搜索窗尺寸。
+
+任一输入改变（包括标定、滤波选择或窗尺寸）都会得到不同键，**绝不返回陈旧条目**。
+缓存命中/未命中都计数并写入 `timing_s`，因此热缓存复用不会被误报为算法加速
+（`test_cache_reuses_and_invalidates_on_parameter_change`）。GUI 打开新图像时清空会话缓存。
+
+### 7.4 预处理与缓存建立成本计入计时
+
+`run_pipeline` 的 `stats["timing_s"]` 中 `decode_s`、`digest_s`、`patch_stats_s`、
+`estimate_s`、`gat_s`、`denoise_s` **都包含各自缓存构建的时间**，没有把开销挪到
+计时区间之外；热命中时对应阶段为 0 并标记 `*_cache_hit=True`。
+
+### 7.5 浮点一致性说明
+
+本优化不改变算法语义：分块仅在 halo 覆盖完整搜索窗时启用，结果逐位相同；
+统计流水线为块局部求和，与分块大小无关。缓存只复用完全相同输入的产物。
+
+唯一改变浮点累加顺序的是 `inverse_gat`：原来先分别计算整幅“有理式”与“渐近式”
+两个分支再 `where` 选择，现改为在各自索引子集上求值、写入同一预分配输出。
+两条分支逐元素运算相同，因此**逐位相同**（已用 0–20 区间与边界值验证 `array_equal`），
+只是不再分配整幅分支临时数组。`tests/test_optimization.py` 明确记录了容差策略：
+1e-9 的相对参数扰动作用于恢复结果的最大像素位移 < 1e-6 线性量级（远小于一个 8 位码值），
+且不会放大颜色偏差（`test_rounding_tolerance_does_not_amplify_colour_bias`）。
+
+> 缩小搜索窗、降低迭代次数等**改变算法语义**的做法不在此列，也未用于本优化；
+> 本仓库不做“等价优化”的混用。
+
+### 7.6 独立测量入口（`scripts/measure_opt.py`）
+
+与质量评估（`scripts/evaluate.py`）和测试套件相互独立，专门测量**代价与一致性**：
+
+```bash
+python scripts/measure_opt.py --out-dir runs/measure --size 768 --large-size 1536
+```
+
+它分别生成并测量三类场景（`lowlight/workloads.py`），**不因简单图像快就断言整体有效**：
+
+- `uniform_dark`：近乎平坦的极暗场景（容易去噪，单独快不说明问题）；
+- `dense_texture`：全幅高频纹理 + 细亮笔画（NLM 最坏情况）；
+- `noise_step`：噪声强度沿对角线突变（标定块跨界失真、单一阈值顾此失彼）。
+
+报告内容：
+
+- **冷启动**每阶段耗时（含预处理与缓存建立）；
+- **热复用**（同参数重复、改强度后）耗时，用以区分复用收益与算法本身；
+- **像素一致性**：与保留的未优化实现 `run_pipeline_legacy` 比较 RMSE、最大绝对误差；
+- **细线残差**：仅在含细线的场景有意义（`uniform_dark`/`noise_step` 无细线 → nan，明确标注）；
+- **内存峰值**：`tracemalloc` **看不到 NumPy 缓冲区**，因此改用**新进程**读取内核
+  `VmHWM`（`measure_subprocess`），并扣除仅加载图像、不做运算的基线；
+- 秒表与内存分进程隔离测量，避免探针子进程争抢 CPU 污染计时。
+
+**本机实测（768px 三场景 / 1536px 放大）给出的诚实结论**：
+
+- **冷启动不比旧实现快**（约 0.9–1.1×）。两者在声明标定下跑的是同一个 NLM；
+  优化冷路径反而额外付出内容摘要与若干防御性拷贝的代价。**本工具不声称冷启动加速。**
+- **复用才是成本下降处**：共享会话缓存下同参数重复约 0.10 s，而冷启动约 0.39–0.59 s；
+  改强度会正确失效去噪缓存，热改强度约 0.36–0.39 s。
+- **估计阶段是可行性收益，而非去噪加速**：旧 Theil–Sen 在 768px 需 ~6.65 亿对斜率
+  （约 16 GB），1536px 需约 108 亿对（约 258 GB），根本跑不起来；快速估计精确且可行。
+- **内存峰值基本不变**（几个百分点内）。峰值来自流水线返回的**整幅结果数组**，
+  而非去噪工作集；halo 分块约束的是 NLM 每块的窗口，并不约束这些结果数组。
+- **像素一致**：所有场景、所有尺寸 `max|Δ| = 0`（与旧实现逐位相同）。
+
+未优化实现保留为 `run_pipeline_legacy`（旧估计器 + 整图 NLM），供上述 A/B 对照。
+
+---
+
+## 8. 窗口启动步骤（与终端辅助分开）
+
+> 终端命令只用于**辅助暗光恢复**（批处理、测量、测试）；日常恢复以图形窗口为主，
+> 启动步骤独立列在此处。
+
+**桌面环境（系统自带 Tkinter）**
+
+```bash
+python -m lowlight.gui          # 或安装后：lowlight-gui
+```
+
+**无 root / 容器环境（需先按附录 A 解包 tkinter 与 Xvfb）**
+
+```bash
+# 1) 启动虚拟显示（已有 DISPLAY 时跳过）
+Xvfb :99 -screen 0 1600x1000x24 &
+
+# 2) 用启动脚本，并指向解包出的 tkinter（脚本会设置 PYTHONPATH 等）
+export DISPLAY=:99
+export LOWLIGHT_TK_ROOT="$HOME/.local/extracted"
+./run_gui.sh
+```
+
+若不用脚本，等价的手动设置是：
+
+```bash
+export DISPLAY=:99
+export PYTHONPATH="$HOME/.local/extracted/tk/usr/lib/python3.11:$PYTHONPATH"
+export LD_LIBRARY_PATH="$HOME/.local/extracted/deps/usr/lib:$LD_LIBRARY_PATH"
+python -m lowlight.gui
+```
+
+窗口内操作顺序：**打开图像 → （可选）勾选并填写 α/σ_r 标定 → 调强度/暗部提升
+→ 运行恢复 → 查看暗部细节对比 → 导出**。若运行状态显示 `✗ 恢复图像异常`，说明恢复
+图像本身有问题（通常是标定偏离实际或强度过大），按状态区提示调整后重跑。
+
+---
+
+## 9. 模块结构
 
 ```
 lowlight/
   color.py         sRGB/线性转换、亮度系数
   noise.py         仿射泊松-高斯模型、归一化 GAT 与精确无偏逆变换
-  calibration.py   块统计 + Theil–Sen 噪声参数自动估计
-  denoise.py       GAT 域 NLM（默认）与 Haar 小波（回退）边缘保持去噪
+  stats.py         可复用块统计表示、O(n log n) 精确 Theil–Sen
+  calibration.py   块统计 + Theil–Sen 噪声参数自动估计（保留旧实现供 A/B）
+  denoise.py       GAT 域 NLM（默认，halo 分块）与 Haar 小波（回退）
   lifting.py       有界、平滑回落、按通道保色的暗部提升
-  reliability.py   逐像素可靠性标志与叠加图
-  pipeline.py      端到端流水线、图像读写、结果导出
+  reliability.py   逐像素可靠性标志、恢复图像侧异常检测与叠加图
+  cache.py         分阶段按字节 LRU 缓存与精确失效键
+  pipeline.py      端到端流水线（含缓存与计时）、图像读写、结果导出、旧路径
+  workloads.py     三类基准场景与 GUI 暗光样张生成器
   synthetic.py     测试用合成观测生成（运行时不导入）
   metrics.py       细线/暗部/颜色/黑块等评估指标
   cli.py           命令行辅助入口
   gui.py           图形恢复窗口（主入口）
-tests/             算法与 GUI 测试
-scripts/evaluate.py 离线评估报告
+tests/             算法、优化一致性、GUI 测试
+scripts/evaluate.py   离线质量评估报告
+scripts/measure_opt.py 独立的代价/一致性测量入口
 ```
 
 ## 附录 A：无 root 环境下的 Tkinter / Xvfb 准备
